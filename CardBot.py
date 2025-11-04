@@ -851,6 +851,37 @@ async def packopen_slash(interaction: discord.Interaction, pack: str):
         await interaction.followup.send(embeds=[summary, *card_embeds[:mid]], files=files_first)
         await interaction.followup.send(embeds=card_embeds[mid:], files=files_second)
 
+# -------- /profile @user (show the stats of a specified user) --------
+
+@bot.tree.command(name="profile", description="Show specified user profile.")
+@app_commands.describe(user="@User")
+async def profile_slash(interaction: discord.Interaction, user: discord.User):
+    ensure_db()
+    gid = _guild_id(interaction)
+    uid = user.id
+    rarity_points = dict(POINTS_FROM_RARITY)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        rarities = {row["id"]: row["rarity"] for row in cur.execute("SELECT id, rarity FROM cards")}
+        tokens = cur.execute("SELECT tokens_used FROM users_guild WHERE guild_id=? AND user_id=?", (gid,uid))
+        token_count = tokens = cur.fetchone()[0]
+        owned_ids = [r[0] for r in cur.execute(
+            "SELECT card_id FROM user_collection_guild WHERE guild_id=? AND user_id=?",
+            (gid, uid)
+        )]
+        pts = 0
+        for cid in owned_ids:
+            r = rarities.get(cid, "Common")
+            pts += rarity_points.get(r, 0)
+        
+    message = []
+    message.append(f'{user.mention}\'s Profile')
+    message.append(f'Tokens Used: {token_count}')
+    message.append(f'Collection Score: {pts}')
+    await interaction.response.send_message("\n".join(message), ephemeral=False)
+
+
 # --------- Autocomplete for the 'pack' argument ---------
 
 @packopen_slash.autocomplete("pack")
