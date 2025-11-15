@@ -1,9 +1,12 @@
 # CardBot.py
 # Token: MTQxOTEyMjA3MTE4MjY0MzM4Mg.GeG_dm.LCoJ1iESRp_NlLz-xMHc3jxKiZNg02AUFYRu2k
+# ------------------------------------------------------------
+
 import os
 import io
 import re
 import time
+import json
 import random
 import sqlite3
 import mimetypes
@@ -26,19 +29,18 @@ except Exception:
 
 # ---------- CONFIG ----------
 DB_PATH = "cards.db"
-SQL_BOOTSTRAP = "black_bolt_types_placeholders.sql"  # .sql file for the cards table
+SQL_BOOTSTRAP = "black_bolt_types_placeholders.sql"
 INTENTS = discord.Intents.default()
-INTENTS.members = True  # nicer names in /scoreboard (optional, but enable Members intent in Dev Portal)
+INTENTS.message_content = False
+INTENTS.members = True  # Enable in Dev Portal for best results
 BOT_ACTIVITY = "Opening packs (/packopen)"
-GUILD_ID = os.getenv("GUILD_ID")  # e.g. "123456789012345678"
+GUILD_ID = os.getenv("GUILD_ID")  # optional; we now sync to all joined guilds
 PACK_NAME_DEFAULT = "Black Bolt"
 
-EMOJI_CARD = "🖼️"  # emoji used in /collection
+EMOJI_CARD = "🖼️"
 
-# While testing, you can force everybody to be topped up to TOKEN_CAP each time their balance is loaded.
-DEV_FORCE_MAX_TOKENS = True   # set False to use normal timed accrual
-
-# ---------------------------
+# Dev knob for testing tokens
+DEV_FORCE_MAX_TOKENS = True
 
 # ---------- IMAGE LIMITS / SETTINGS ----------
 MAX_UPLOAD_BYTES = 7 * 1024 * 1024
@@ -47,28 +49,25 @@ FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DiscordCardBot/1.0",
     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
 }
-# --------------------------------------------
 
 # ---------- ECONOMY / POINTS ----------
-TOKEN_CAP = 50
-TOKEN_INITIAL = 10
+TOKEN_CAP = 75
+TOKEN_INITIAL = 15
 TOKEN_REFILL_SECS = 2 * 60 * 60  # 2 hours
-ESSENCE_PER_TOKEN = 350
-TOTAL_CARDS = 172  # whole set (incl. specials)
+ESSENCE_PER_TOKEN = 200
+TOTAL_CARDS = 172
 
-# Essence from rarity (duplicates → essence)
 ESSENCE_FROM_RARITY = {
     "Common": 100,
     "Uncommon": 250,
     "Rare": 500,
     "Double Rare": 1000,
     "Ultra Rare": 1250,
-    "Illistration Rare": 1500,            # matches DB spelling
-    "Special Illistration Rare": 2000,    # matches DB spelling
+    "Illistration Rare": 1500,
+    "Special Illistration Rare": 2000,
     "Black White Rare": 5000,
 }
 
-# Points for scoreboard
 POINTS_FROM_RARITY = {
     "Common": 1,
     "Uncommon": 2,
@@ -85,21 +84,17 @@ RARITY_NORMALIZE = {
     "uncommon": "Uncommon",
     "rare": "Rare",
     "double rare": "Double Rare",
-    # DB uses "Illistration Rare"
     "illustration rare": "Illistration Rare",
     "illistration rare": "Illistration Rare",
     "ultra rare": "Ultra Rare",
-    # DB uses "Special Illistration Rare"
     "special illustration rare": "Special Illistration Rare",
     "special illistration rare": "Special Illistration Rare",
-    # DB uses "Black White Rare"
     "black white rare": "Black White Rare",
     "black ewhite rare": "Black White Rare",
 }
 
-COMMON_POOL = {"Common", "Uncommon"}  # both are considered "common cards"
+COMMON_POOL = {"Common", "Uncommon"}
 
-# Priority & odds for the hit slot (rarer first). Tuple: (normalized key, 1/N chance)
 HIT_TIERS: List[Tuple[str, int]] = [
     ("black white rare", 20),
     ("special illistration rare", 18),
@@ -109,10 +104,34 @@ HIT_TIERS: List[Tuple[str, int]] = [
     ("rare", 5),
 ]
 
-# ------------- DB helpers -------------
+# --------- DUELS / SIM / AUCTION / STREAK SETTINGS ---------
+DUEL_COOLDOWN_SECS = 60 * 5
+DUEL_REWARDS = {"easy": (1, 200), "normal": (2, 350), "hard": (3, 500)}
+DUEL_CONSOLATION = (0, 100)
+DUEL_ROUNDS = 3
+NPCS = {"rookie": {"name": "Rookie Ronin", "power_bias": 0.85},
+        "veteran": {"name": "Veteran Vale", "power_bias": 1.00},
+        "master": {"name": "Master Myra", "power_bias": 1.15}}
+RARITY_POWER = {"Common": 1, "Uncommon": 2, "Rare": 4, "Double Rare": 7,
+                "Ultra Rare": 10, "Illistration Rare": 8, "Special Illistration Rare": 13, "Black White Rare": 20}
+PVP_ROUNDS = 3
+PVP_ESSENCE_WIN = 250
+PVP_ESSENCE_LOSS = 100
+PVP_RARITY_POWER = dict(RARITY_POWER)
 
+# --------- SHOP SETTINGS ----------
+SHOP_COMMON_SLOTS = 4
+SHOP_RARE_SLOT = 5
+SHOP_SPECIAL_SLOT = 6
+SHOP_TOKEN_BUNDLE = 5
+SHOP_PRICE_TOKEN_BUNDLE = 2000
+SHOP_PRICE_COMMON_CARD = 400
+SHOP_PRICE_RARE_CARD = 2000
+# ------------------------------------------------------------
+
+# ------------- DB helpers -------------
 def ensure_db():
-    """Cards table (from SQL) + guild-scoped user tables."""
+    """Ensure DB schema exists; extends with name cache, trading, and shop tables."""
     if not os.path.exists(DB_PATH) and os.path.exists(SQL_BOOTSTRAP):
         with open(SQL_BOOTSTRAP, "r", encoding="utf-8") as f:
             sql_text = f.read()
@@ -121,7 +140,7 @@ def ensure_db():
 
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # Guild-scoped users
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS users_guild (
             guild_id       TEXT NOT NULL,
@@ -134,7 +153,7 @@ def ensure_db():
             PRIMARY KEY(guild_id, user_id)
         )
         """)
-        # Guild-scoped collection
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS user_collection_guild (
             guild_id TEXT NOT NULL,
@@ -143,13 +162,187 @@ def ensure_db():
             PRIMARY KEY(guild_id, user_id, card_id)
         )
         """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS users_names_guild (
+            guild_id TEXT NOT NULL,
+            user_id  TEXT NOT NULL,
+            display  TEXT NOT NULL,
+            username TEXT NOT NULL,
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS npc_duel_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id   TEXT NOT NULL,
+            user_id    TEXT NOT NULL,
+            npc_id     TEXT NOT NULL,
+            difficulty TEXT NOT NULL,
+            rounds_json TEXT NOT NULL,
+            result     TEXT NOT NULL,
+            reward_tokens INTEGER NOT NULL DEFAULT 0,
+            reward_essence INTEGER NOT NULL DEFAULT 0,
+            created_ts INTEGER NOT NULL
+        )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS npc_duel_cd (
+            guild_id TEXT NOT NULL,
+            user_id  TEXT NOT NULL,
+            next_ts  INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS pvp_duel_challenges (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id       TEXT NOT NULL,
+            challenger_id  TEXT NOT NULL,
+            target_id      TEXT NOT NULL,
+            stake_tokens   INTEGER NOT NULL DEFAULT 0,
+            status         TEXT NOT NULL,
+            created_ts     INTEGER NOT NULL
+        )
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS pvp_duel_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id   TEXT NOT NULL,
+            user_a     TEXT NOT NULL,
+            user_b     TEXT NOT NULL,
+            rounds_json TEXT NOT NULL,
+            result      TEXT NOT NULL,
+            stake_tokens INTEGER NOT NULL DEFAULT 0,
+            reward_tokens_a INTEGER NOT NULL DEFAULT 0,
+            reward_tokens_b INTEGER NOT NULL DEFAULT 0,
+            reward_essence_a INTEGER NOT NULL DEFAULT 0,
+            reward_essence_b INTEGER NOT NULL DEFAULT 0,
+            created_ts  INTEGER NOT NULL
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS auction_listings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id         INTEGER NOT NULL,
+            seller_user_id  TEXT NOT NULL,
+            seller_guild_id TEXT NOT NULL,
+            price_amount    INTEGER NOT NULL,
+            price_currency  TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            created_ts      INTEGER NOT NULL,
+            expires_ts      INTEGER NOT NULL,
+            buyer_user_id   TEXT,
+            buyer_guild_id  TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auction_active ON auction_listings(status, expires_ts)")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS streaks_guild (
+            guild_id      TEXT NOT NULL,
+            user_id       TEXT NOT NULL,
+            daily_count   INTEGER NOT NULL DEFAULT 0,
+            daily_day     INTEGER NOT NULL DEFAULT 0,
+            weekly_count  INTEGER NOT NULL DEFAULT 0,
+            weekly_key    TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS trades_guild (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            proposer_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            proposer_card_id INTEGER NOT NULL,
+            target_card_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_ts INTEGER NOT NULL
+        )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_trades_open ON trades_guild(guild_id, target_id, status, created_ts)")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS shop_state_guild (
+            guild_id TEXT PRIMARY KEY,
+            yyyymmdd INTEGER NOT NULL,
+            items_json TEXT NOT NULL
+        )
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS shop_purchases_guild (
+            guild_id TEXT NOT NULL,
+            buyer_id TEXT NOT NULL,
+            yyyymmdd INTEGER NOT NULL,
+            slot INTEGER NOT NULL,
+            UNIQUE (guild_id, yyyymmdd, slot)
+        )
+        """)
+
         conn.commit()
 
 def _now_ts() -> int:
     return int(time.time())
 
+def _guild_id(interaction: discord.Interaction) -> str:
+    return str(interaction.guild.id) if interaction.guild else "DM"
+
+# ----- Name cache helpers -----
+def _note_display_name(conn: sqlite3.Connection, guild_id: str, user: discord.abc.User):
+    display = (getattr(user, "display_name", None) or getattr(user, "global_name", None) or user.name or f"User {user.id}")[:64]
+    username = (user.name or str(user.id))[:64]
+    conn.execute("""
+        INSERT INTO users_names_guild(guild_id, user_id, display, username, updated_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET
+          display=excluded.display, username=excluded.username, updated_ts=excluded.updated_ts
+    """, (guild_id, str(user.id), display, username, _now_ts()))
+    conn.commit()
+
+async def _note_name_interaction(interaction: discord.Interaction) -> None:
+    """Call this at the TOP of each slash command to cache display names safely."""
+    if interaction.guild:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                _note_display_name(conn, _guild_id(interaction), interaction.user)
+        except Exception:
+            pass
+
+async def _resolve_display_name(interaction: discord.Interaction, uid: int) -> str:
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT display FROM users_names_guild WHERE guild_id=? AND user_id=?",
+                           (gid, str(uid))).fetchone()
+    if row and row["display"]:
+        return row["display"]
+
+    member = None
+    if interaction.guild:
+        member = interaction.guild.get_member(uid)
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except Exception:
+                member = None
+    if member:
+        with sqlite3.connect(DB_PATH) as conn:
+            _note_display_name(conn, gid, member)
+        return member.display_name
+
+    try:
+        user = await interaction.client.fetch_user(uid)
+        with sqlite3.connect(DB_PATH) as conn:
+            _note_display_name(conn, gid, user)
+        return getattr(user, "global_name", None) or user.name or f"User {uid}"
+    except Exception:
+        return f"User {uid}"
+
+# ----- Time helpers -----
 def _even_2h_anchor(ts: int) -> int:
-    """Return the latest even-hour boundary <= ts (00, 02, 04, …) in local time."""
     lt = time.localtime(ts)
     even_hour = lt.tm_hour - (lt.tm_hour % 2)
     anchor = time.struct_time((lt.tm_year, lt.tm_mon, lt.tm_mday, even_hour, 0, 0,
@@ -163,13 +356,21 @@ def _next_even_2h(ts: int) -> int:
         nxt += TOKEN_REFILL_SECS
     return nxt
 
-def _guild_id(interaction: discord.Interaction) -> str:
-    return str(interaction.guild.id) if interaction.guild else "DM"
+def _midnight_anchor_local(ts: int) -> int:
+    lt = time.localtime(ts)
+    anchor = time.struct_time((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst))
+    return int(time.mktime(anchor))
+
+def _yyyymmdd_local(ts: int) -> int:
+    lt = time.localtime(ts)
+    # FIX: tm_mday (calendar day), not tm_day
+    return lt.tm_year * 10000 + lt.tm_mon * 100 + lt.tm_mday
+
+def _iso_week_key(ts: int) -> str:
+    return time.strftime("%G-%V", time.localtime(ts))
 
 # ----- Guild-scoped economy -----
-
 def _accrue_tokens(conn: sqlite3.Connection, guild_id: str, user_id: int) -> Dict:
-    """Load or create guild-scoped user row, apply timed accrual OR dev force max."""
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     row = cur.execute("SELECT * FROM users_guild WHERE guild_id=? AND user_id=?",
@@ -197,7 +398,6 @@ def _accrue_tokens(conn: sqlite3.Connection, guild_id: str, user_id: int) -> Dic
 
     user = dict(row)
 
-    # During testing, keep everyone topped up to the cap.
     if DEV_FORCE_MAX_TOKENS and user["tokens"] < TOKEN_CAP:
         cur.execute("UPDATE users_guild SET tokens=? WHERE guild_id=? AND user_id=?",
                     (TOKEN_CAP, guild_id, str(user_id)))
@@ -205,7 +405,6 @@ def _accrue_tokens(conn: sqlite3.Connection, guild_id: str, user_id: int) -> Dic
         user["tokens"] = TOKEN_CAP
         return user
 
-    # Normal timed accrual
     tokens = int(user["tokens"])
     last_up = int(user["last_update_ts"]) if user["last_update_ts"] else _even_2h_anchor(now)
     last_tick = last_up // TOKEN_REFILL_SECS
@@ -233,7 +432,6 @@ def _spend_tokens(conn: sqlite3.Connection, guild_id: str, user_id: int, amount:
         return False, user, "Amount must be > 0."
     if user["tokens"] < amount:
         nxt = _next_even_2h(_now_ts())
-        # Windows doesn't support %-I, so handle left-trim of 0
         when = time.strftime("%I:%M %p", time.localtime(nxt)).lstrip("0")
         return False, user, f"You have {user['tokens']} token(s). Next refill at {when}."
     new_t = user["tokens"] - amount
@@ -265,8 +463,24 @@ def _add_essence(conn: sqlite3.Connection, guild_id: str, user_id: int, amount: 
     user["essence"] = new_e
     return user
 
-# ----- Guild-scoped collection -----
+def _add_essence_delta(conn: sqlite3.Connection, guild_id: str, user_id: int, delta: int) -> Tuple[bool, int]:
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    row = cur.execute("SELECT essence FROM users_guild WHERE guild_id=? AND user_id=?",
+                      (guild_id, str(user_id))).fetchone()
+    if not row:
+        _accrue_tokens(conn, guild_id, user_id)
+        row = cur.execute("SELECT essence FROM users_guild WHERE guild_id=? AND user_id=?",
+                          (guild_id, str(user_id))).fetchone()
+    current = int(row["essence"])
+    if delta < 0 and current < -delta:
+        return False, current
+    new_e = current + delta
+    cur.execute("UPDATE users_guild SET essence=? WHERE guild_id=? AND user_id=?", (new_e, guild_id, str(user_id)))
+    conn.commit()
+    return True, new_e
 
+# ----- Collection helpers -----
 def _has_card(conn: sqlite3.Connection, guild_id: str, user_id: int, card_id: int) -> bool:
     cur = conn.cursor()
     r = cur.execute(
@@ -281,8 +495,23 @@ def _give_card(conn: sqlite3.Connection, guild_id: str, user_id: int, card_id: i
                 (guild_id, str(user_id), card_id))
     conn.commit()
 
-# ----- Cards -----
+def _remove_card(conn: sqlite3.Connection, guild_id: str, user_id: int, card_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM user_collection_guild WHERE guild_id=? AND user_id=? AND card_id=?",
+        (guild_id, str(user_id), card_id)
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
+def _user_owned_card_ids(conn: sqlite3.Connection, guild_id: str, user_id: int) -> List[int]:
+    cur = conn.cursor()
+    return [r[0] for r in cur.execute(
+        "SELECT card_id FROM user_collection_guild WHERE guild_id=? AND user_id=?",
+        (guild_id, str(user_id))
+    )]
+
+# ----- Cards catalog -----
 def fetch_pack_cards(pack: str) -> List[Dict]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -363,8 +592,29 @@ def open_one_pack(pack_name: str) -> Tuple[List[Dict], str]:
     picked.append(hit_card)
     return picked, hit_label
 
-# ------------- Image helpers -------------
+# --------- Misc helpers ---------
+def _emoji_link(url: str) -> str:
+    url = (url or "").strip()
+    return f"[{EMOJI_CARD}]({url})" if url else EMOJI_CARD
 
+def _rarity_of_card_id(conn: sqlite3.Connection, cid: int) -> str:
+    cur = conn.cursor()
+    r = cur.execute("SELECT rarity FROM cards WHERE id=?", (cid,)).fetchone()
+    return r[0] if r else "Common"
+
+def _name_of_card_id(conn: sqlite3.Connection, cid: int) -> str:
+    cur = conn.cursor()
+    r = cur.execute("SELECT name FROM cards WHERE id=?", (cid,)).fetchone()
+    return r[0] if r else f"Card {cid}"
+
+def _label_of_card_id(conn: sqlite3.Connection, cid: int) -> str:
+    cur = conn.cursor()
+    r = cur.execute("SELECT name, rarity, english_no FROM cards WHERE id=?", (cid,)).fetchone()
+    if r:
+        return f"#{cid} | {r[0]} ({r[1]} / {r[2]})"
+    return f"#{cid}"
+
+# ------------- Image helpers -------------
 def _is_image_content_type(ct: str) -> bool:
     return ct.lower().startswith("image/") if ct else False
 
@@ -461,17 +711,10 @@ async def fetch_image_as_file(session: aiohttp.ClientSession, url: str, filename
         return None, "encode-error:UnidentifiedImageError"
 
 # ------------- Bot setup -------------
-
 class CardBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=INTENTS)
         self.synced = False
-        self.guild = None
-        if GUILD_ID:
-            try:
-                self.guild = discord.Object(id=int(GUILD_ID))
-            except ValueError:
-                print("WARN: GUILD_ID is set but not an integer; syncing globally.")
 
     async def setup_hook(self):
         pass
@@ -481,38 +724,64 @@ bot = CardBot()
 @bot.event
 async def on_ready():
     ensure_db()
-    if not bot.synced:
+    # Fast per-guild sync so slash commands appear instantly in every server
+    try:
+        synced_guilds = 0
+        for g in bot.guilds:
+            try:
+                await bot.tree.sync(guild=discord.Object(id=g.id))
+                print(f"[sync] Slash commands synced to guild {g.id} ({g.name})")
+                synced_guilds += 1
+            except Exception as e:
+                print(f"[sync error] guild {g.id}: {e}")
+        # Global sync as a harmless fallback
         try:
-            if bot.guild:
-                await bot.tree.sync(guild=bot.guild)
-                print(f"[sync] Slash commands synced to guild {bot.guild.id}")
-            else:
-                await bot.tree.sync()
-                print("[sync] Global slash commands synced")
-            bot.synced = True
+            await bot.tree.sync()
+            print("[sync] Global slash commands synced")
         except Exception as e:
-            print(f"[sync error] {e}")
+            print(f"[global sync error] {e}")
+        bot.synced = True
+    except Exception as e:
+        print(f"[sync outer error] {e}")
+
     await bot.change_presence(activity=discord.Game(name=BOT_ACTIVITY))
     print(f"Logged in as {bot.user} (id {bot.user.id})")
 
-# --------- Utility ---------
+# NEW: Sync immediately when the bot joins a new guild
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    try:
+        await bot.tree.sync(guild=discord.Object(id=guild.id))
+        print(f"[sync] Joined & synced {guild.id} ({guild.name})")
+    except Exception as e:
+        print(f"[sync error on join] {guild.id}: {e}")
+
+# Manual resync helper
+@bot.tree.command(name="resync", description="Force re-sync slash commands to all joined guilds.")
+@app_commands.guild_only()
+async def resync_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    ok = 0
+    for g in interaction.client.guilds:
+        try:
+            await interaction.client.tree.sync(guild=discord.Object(id=g.id))
+            ok += 1
+        except Exception as e:
+            print(f"[resync error] {g.id}: {e}")
+    await interaction.followup.send(f"Resynced to {ok} guild(s).", ephemeral=True)
 
 def choices_from(query: str, items: List[str], limit: int = 25) -> List[app_commands.Choice[str]]:
     query_low = (query or "").lower()
     filtered = [p for p in items if query_low in p.lower()] if query_low else items
     return [app_commands.Choice(name=p, value=p) for p in filtered[:limit]]
 
-def _emoji_link(url: str) -> str:
-    """Clickable emoji linking to the image (falls back to plain emoji)."""
-    url = (url or "").strip()
-    return f"[{EMOJI_CARD}]({url})" if url else EMOJI_CARD
-
 # =============== SLASH COMMANDS ===============
 
-# /token — show current token count and next refill time (guild-scoped)
+# /token
 @bot.tree.command(name="token", description="Show your token balance and next refill time (per server).")
+@app_commands.guild_only()
 async def token_slash(interaction: discord.Interaction):
-    ensure_db()
+    await _note_name_interaction(interaction)
     gid = _guild_id(interaction)
     with sqlite3.connect(DB_PATH) as conn:
         user = _accrue_tokens(conn, gid, interaction.user.id)
@@ -523,15 +792,26 @@ async def token_slash(interaction: discord.Interaction):
             ephemeral=True
         )
 
-# /gamble amount (guild-scoped)
-@bot.tree.command(name="gamble", description="Gamble some of your tokens in THIS server. Outcomes: double / refund / lose half.")
+# /essence
+@bot.tree.command(name="essence", description="Show your total essence in THIS server.")
+@app_commands.guild_only()
+async def essence_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        user = _accrue_tokens(conn, gid, interaction.user.id)
+        await interaction.response.send_message(
+            f"💠 You have **{user['essence']}** essence in this server.", ephemeral=True
+        )
+
+# /gamble
+@bot.tree.command(name="gamble", description="Gamble some of your tokens in THIS server.")
+@app_commands.guild_only()
 @app_commands.describe(amount="How many tokens to gamble (up to your balance here).")
 async def gamble_slash(interaction: discord.Interaction, amount: int):
-    ensure_db()
+    await _note_name_interaction(interaction)
     if amount <= 0:
-        await interaction.response.send_message(
-            "Enter a positive amount. Reminder: token cap is 50.", ephemeral=True)
-        return
+        await interaction.response.send_message("Enter a positive amount.", ephemeral=True); return
     gid = _guild_id(interaction)
     with sqlite3.connect(DB_PATH) as conn:
         user = _accrue_tokens(conn, gid, interaction.user.id)
@@ -544,15 +824,15 @@ async def gamble_slash(interaction: discord.Interaction, amount: int):
         roll = random.randint(1, 3)
         if roll == 1:
             _add_tokens(conn, gid, interaction.user.id, min(amount * 2, TOKEN_CAP))
-            msg = "✨ The Pokémon adore you! **Doubled your bet** and added it to your tokens."
+            msg = "✨ **Doubled your bet** and added to your tokens."
         elif roll == 2:
             _add_tokens(conn, gid, interaction.user.id, amount)
-            msg = "😊 The Pokémon are generous. **Your bet is refunded**."
+            msg = "😊 **Your bet is refunded**."
         else:
             give_back = amount // 2
             if give_back:
                 _add_tokens(conn, gid, interaction.user.id, give_back)
-            msg = "😴 The Pokémon felt like Snorlax today. **You lost half of your bet.**"
+            msg = "😴 **You lost half of your bet.**"
 
         final = _accrue_tokens(conn, gid, interaction.user.id)
         cap_note = " (Token cap 50 — extra vanishes)" if final["tokens"] >= TOKEN_CAP else ""
@@ -561,25 +841,20 @@ async def gamble_slash(interaction: discord.Interaction, amount: int):
             ephemeral=True
         )
 
-# /sell amount — sell tokens for essence (guild-scoped)
-@bot.tree.command(name="sell", description="Sell tokens for Pokémon essence in THIS server (350 essence per token).")
+# /sell
+@bot.tree.command(name="sell", description="Sell tokens for essence in THIS server (350 essence per token).")
+@app_commands.guild_only()
 @app_commands.describe(amount="How many tokens you want to sell.")
 async def sell_slash(interaction: discord.Interaction, amount: int):
-    ensure_db()
+    await _note_name_interaction(interaction)
     if amount <= 0:
-        await interaction.response.send_message(
-            "🤨 The Pokémon are confused—you can't sell invisible tokens. Use a number > 0.",
-            ephemeral=True
-        )
-        return
+        await interaction.response.send_message("Use a number > 0.", ephemeral=True); return
     gid = _guild_id(interaction)
     with sqlite3.connect(DB_PATH) as conn:
         user = _accrue_tokens(conn, gid, interaction.user.id)
         if amount > user["tokens"]:
             await interaction.response.send_message(
-                f"😡 The Pokémon got angry at your attempt to cheat. "
-                f"Enter a number ≤ your tokens here (you have {user['tokens']}).",
-                ephemeral=True
+                f"Enter a number ≤ your tokens here (you have {user['tokens']}).", ephemeral=True
             )
             return
         cur = conn.cursor()
@@ -592,34 +867,14 @@ async def sell_slash(interaction: discord.Interaction, amount: int):
         final = _accrue_tokens(conn, gid, interaction.user.id)
         await interaction.response.send_message(
             f"💎 Sold **{amount}** token(s) for **{gained} essence**.\n"
-            f"Now you have **{final['tokens']}** tokens and **{final['essence']}** essence in this server.",
+            f"Now you have **{final['tokens']}** tokens and **{final['essence']}** essence here.",
             ephemeral=True
         )
 
-# /essence — show essence (guild-scoped)
-@bot.tree.command(name="essence", description="Show your total Pokémon essence in THIS server.")
-async def essence_slash(interaction: discord.Interaction):
-    ensure_db()
-    gid = _guild_id(interaction)
-    with sqlite3.connect(DB_PATH) as conn:
-        user = _accrue_tokens(conn, gid, interaction.user.id)
-        await interaction.response.send_message(
-            f"💠 You have **{user['essence']}** essence in this server.", ephemeral=True
-        )
-
-# -------- FULL COLLECTION VIEW (001–086 + specials under each) --------
-
+# -------- FULL COLLECTION VIEW --------
 def _collection_embeds_full(conn: sqlite3.Connection, guild_id: str, user_id: int) -> List[discord.Embed]:
-    """
-    Build a full collection view:
-      - Base cards 001..086 listed in order
-      - Under each base card, a 'Special' line listing special variants for that Pokémon name
-      - Owned base/specials show details + clickable emoji to the image; unowned show ????? placeholders
-      - Splits across multiple embeds if too long
-    """
     cards = fetch_pack_cards(PACK_NAME_DEFAULT)
 
-    # split base vs specials; group specials by name
     base_cards: List[Dict] = []
     specials_by_name: Dict[str, List[Dict]] = {}
     for c in cards:
@@ -666,10 +921,7 @@ def _collection_embeds_full(conn: sqlite3.Connection, guild_id: str, user_id: in
         if owned_base:
             base_line = f"**{base_no}** — {name} • *{c['type']}* • **{c['rarity']}** {_emoji_link(c.get('image_url',''))}"
         else:
-            base_line = (
-                f"**{base_no}** — ????\n"
-                f"    Type: ???? • Rarity: ????"
-            )
+            base_line = f"**{base_no}** — ????\n    Type: ???? • Rarity: ????"
 
         specials = specials_by_name.get(name, [])
         if specials:
@@ -700,13 +952,13 @@ def _collection_embeds_full(conn: sqlite3.Connection, guild_id: str, user_id: in
     return embeds
 
 @bot.tree.command(name="collection", description="View your full Black Bolt collection in THIS server.")
+@app_commands.guild_only()
 async def collection_slash(interaction: discord.Interaction):
-    ensure_db()
+    await _note_name_interaction(interaction)
     await interaction.response.defer(ephemeral=True)
     gid = _guild_id(interaction)
     with sqlite3.connect(DB_PATH) as conn:
         embeds = _collection_embeds_full(conn, gid, interaction.user.id)
-
     try:
         if len(embeds) <= 10:
             await interaction.followup.send(embeds=embeds, ephemeral=True)
@@ -717,10 +969,11 @@ async def collection_slash(interaction: discord.Interaction):
         for emb in embeds:
             await interaction.followup.send(embed=emb, ephemeral=True)
 
-# /scoreboard — leaderboard (guild-scoped)
+# /scoreboard
 @bot.tree.command(name="scoreboard", description="Server leaderboard by collection points and tokens used.")
+@app_commands.guild_only()
 async def scoreboard_slash(interaction: discord.Interaction):
-    ensure_db()
+    await _note_name_interaction(interaction)
     gid = _guild_id(interaction)
     rarity_points = dict(POINTS_FROM_RARITY)
     with sqlite3.connect(DB_PATH) as conn:
@@ -744,9 +997,8 @@ async def scoreboard_slash(interaction: discord.Interaction):
     lines = []
     scores.sort(key=lambda t: (-t[1], -t[2], t[0]))
     for rank, (uid, pts, used) in enumerate(scores[:25], start=1):
-        member = interaction.guild.get_member(uid) if interaction.guild else None
-        name = member.display_name if member else f"User {uid}"
-        lines.append(f"**{rank}. {name}** — {pts} pts • tokens used: {used}")
+        display = await _resolve_display_name(interaction, uid)
+        lines.append(f"**{rank}. {display}** — {pts} pts • tokens used: {used}")
 
     if not lines:
         lines = ["No players yet. Open some packs!"]
@@ -755,28 +1007,35 @@ async def scoreboard_slash(interaction: discord.Interaction):
 
 # Help
 @bot.tree.command(name="help_cardbot", description="Show CardBot commands and what they do.")
+@app_commands.guild_only()
 async def help_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
     text = (
-        "**/packopen pack:** open 1 pack (costs 1 token, per server). Duplicates become essence.\n"
-        "**/token:** see your tokens here and next refill (1 every 2 hours, cap 50; first time = 10 unless DEV_FORCE_MAX_TOKENS).\n"
-        "**/gamble amount:** gamble tokens here (double / refund / lose half). Cap 50 applies.\n"
-        "**/sell amount:** convert tokens → essence here (350 each).\n"
-        "**/essence:** show your essence here.\n"
-        "**/collection:** full Black Bolt collection (001–086 base plus specials under each; emoji opens image).\n"
-        "**/scoreboard:** leaderboard for this server."
+        "**Core**\n"
+        "**/packopen**, **/packs**, **/packsim**, **/collection**, **/scoreboard**, **/token**, **/sell**, **/essence**, **/gamble**\n"
+        "\n**Duels**\n"
+        "**/npcduel_start**, **/duel_challenge**, **/duel_accept**, **/duel_decline**\n"
+        "\n**Auction House**\n"
+        "**/mycards**, **/auction_list**, **/auction_browse**, **/auction_buy**, **/auction_cancel**\n"
+        "Note: Use **/mycards** to copy a numeric ID, then pass it to **/auction_list** `card_id`.\n"
+        "\n**Trading**\n"
+        "**/trade_offer @user my_card_id their_card_id**, **/trade_accept trade_id**, **/trade_decline trade_id**\n"
+        "\n**Essence Shop**\n"
+        "**/shop_show**, **/shop_buy slot**, **/shop_reset** (admin)\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
-# -------- /packopen (guild-scoped; charges 1 token & duplicates → essence) --------
-
-@bot.tree.command(name="packopen", description="Open 1 pack (9 cards) in THIS server and display images for each card.")
+# -------- PACK OPEN --------
+@bot.tree.command(name="packopen", description="Open 1 pack (9 cards) in THIS server and display images.")
+@app_commands.guild_only()
 @app_commands.describe(pack="Choose a pack name")
 async def packopen_slash(interaction: discord.Interaction, pack: str):
-    ensure_db()
+    await _note_name_interaction(interaction)
     await interaction.response.defer(thinking=True, ephemeral=False)
     gid = _guild_id(interaction)
 
     with sqlite3.connect(DB_PATH) as conn:
+        _note_display_name(conn, gid, interaction.user)
         ok, user, reason = _spend_tokens(conn, gid, interaction.user.id, 1)
         if not ok:
             await interaction.followup.send(f"❌ {reason}")
@@ -786,7 +1045,7 @@ async def packopen_slash(interaction: discord.Interaction, pack: str):
         cards, hit_label = open_one_pack(pack)
     except Exception as e:
         with sqlite3.connect(DB_PATH) as conn:
-            _add_tokens(conn, gid, interaction.user.id, 1)  # refund on error
+            _add_tokens(conn, gid, interaction.user.id, 1)  # refund
         await interaction.followup.send(f"❌ {e}")
         return
 
@@ -851,12 +1110,12 @@ async def packopen_slash(interaction: discord.Interaction, pack: str):
         await interaction.followup.send(embeds=[summary, *card_embeds[:mid]], files=files_first)
         await interaction.followup.send(embeds=card_embeds[mid:], files=files_second)
 
-# -------- /profile @user (show the stats of a specified user) --------
-
+# /profile
 @bot.tree.command(name="profile", description="Show specified user profile.")
+@app_commands.guild_only()
 @app_commands.describe(user="@User")
 async def profile_slash(interaction: discord.Interaction, user: discord.User):
-    ensure_db()
+    await _note_name_interaction(interaction)
     gid = _guild_id(interaction)
     uid = user.id
     rarity_points = dict(POINTS_FROM_RARITY)
@@ -864,8 +1123,8 @@ async def profile_slash(interaction: discord.Interaction, user: discord.User):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         rarities = {row["id"]: row["rarity"] for row in cur.execute("SELECT id, rarity FROM cards")}
-        tokens = cur.execute("SELECT tokens_used FROM users_guild WHERE guild_id=? AND user_id=?", (gid,uid))
-        token_count = tokens = cur.fetchone()[0]
+        row_tok = cur.execute("SELECT tokens_used FROM users_guild WHERE guild_id=? AND user_id=?", (gid,uid)).fetchone()
+        token_count = row_tok[0] if row_tok else 0
         owned_ids = [r[0] for r in cur.execute(
             "SELECT card_id FROM user_collection_guild WHERE guild_id=? AND user_id=?",
             (gid, uid)
@@ -874,24 +1133,830 @@ async def profile_slash(interaction: discord.Interaction, user: discord.User):
         for cid in owned_ids:
             r = rarities.get(cid, "Common")
             pts += rarity_points.get(r, 0)
-        
+
     message = []
     message.append(f'{user.mention}\'s Profile')
     message.append(f'Tokens Used: {token_count}')
     message.append(f'Collection Score: {pts}')
     await interaction.response.send_message("\n".join(message), ephemeral=False)
 
-
-# --------- Autocomplete for the 'pack' argument ---------
-
-@packopen_slash.autocomplete("pack")
-async def pack_autocomplete(interaction: discord.Interaction, current: str):
+# -------- Pack list & sim --------
+@bot.tree.command(name="packs", description="List all packs available in the database.")
+@app_commands.guild_only()
+async def packs_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
     try:
-        ensure_db()
         packs = list_packs()
+    except Exception as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True); return
+    if not packs:
+        await interaction.response.send_message("No packs found in the database.", ephemeral=True); return
+    await interaction.response.send_message("**Available packs:**\n- " + "\n- ".join(packs), ephemeral=True)
+
+@bot.tree.command(name="packsim", description="Simulate opening packs without spending tokens.")
+@app_commands.guild_only()
+@app_commands.describe(pack="Pack name (omit or use 'list' to show packs)", n="How many packs to simulate (max 5000)")
+async def packsim_slash(interaction: discord.Interaction, pack: Optional[str] = None, n: int = 100):
+    await _note_name_interaction(interaction)
+    if not pack or pack.strip().lower() == "list":
+        try:
+            packs = list_packs()
+        except Exception as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True); return
+        if not packs:
+            await interaction.response.send_message("No packs found in the database.", ephemeral=True); return
+        await interaction.response.send_message("**Available packs:**\n- " + "\n- ".join(packs), ephemeral=True)
+        return
+
+    n = max(1, min(5000, n))
+    await interaction.response.defer(ephemeral=True)
+    rarity_counts: Dict[str, int] = {}
+    hit_counts: Dict[str, int] = {}
+    try:
+        for _ in range(n):
+            cards, hit_label = open_one_pack(pack)
+            hit_counts[hit_label] = hit_counts.get(hit_label, 0) + 1
+            for c in cards:
+                rarity_counts[c["rarity"]] = rarity_counts.get(c["rarity"], 0) + 1
+    except Exception as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True); return
+
+    exp_essence = 0
+    for rar, cnt in rarity_counts.items():
+        exp_essence += ESSENCE_FROM_RARITY.get(rar, 0) * cnt
+
+    lines = ["**Pack Simulator**", f"Runs: **{n}** on **{pack}**"]
+    lines.append("\n**Per-rarity pulls:**")
+    for rar, cnt in sorted(rarity_counts.items(), key=lambda x: (-x[1], x[0])):
+        lines.append(f"- {rar}: {cnt}")
+    lines.append("\n**Hit slot outcomes:**")
+    for rar, cnt in sorted(hit_counts.items(), key=lambda x: (-x[1], x[0])):
+        lines.append(f"- {rar}: {cnt}")
+    lines.append(f"\nUpper-bound essence (if all dupes): **{exp_essence}**")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+# --------- PvP Duels (unchanged core) ---------
+def _open_challenge_for_target(conn: sqlite3.Connection, guild_id: str, target_id: int) -> Optional[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    return cur.execute(
+        "SELECT * FROM pvp_duel_challenges WHERE guild_id=? AND target_id=? AND status='open' ORDER BY created_ts DESC LIMIT 1",
+        (guild_id, str(target_id))
+    ).fetchone()
+
+def _pvp_score_cards(conn: sqlite3.Connection, card_ids: List[int]) -> int:
+    total = 0.0
+    for cid in card_ids:
+        rar = _rarity_of_card_id(conn, cid)
+        total += PVP_RARITY_POWER.get(rar, 1)
+    total += random.uniform(0, len(card_ids) * 0.75)
+    return int(round(total))
+
+def _sample_user_cards_for_duel(conn: sqlite3.Connection, guild_id: str, user_id: int, k: int) -> List[int]:
+    owned = _user_owned_card_ids(conn, guild_id, user_id)
+    if len(owned) >= k:
+        return random.sample(owned, k)
+    try:
+        pool = [c["id"] for c in fetch_pack_cards(PACK_NAME_DEFAULT)]
+        extra = random.sample(pool, min(k - len(owned), len(pool))) if pool else []
     except Exception:
-        packs = []
-    return choices_from(current, packs, limit=25)
+        extra = []
+    return owned + extra
+
+@bot.tree.command(name="duel_challenge", description="Challenge another player in THIS server to a 3-round card duel.")
+@app_commands.guild_only()
+@app_commands.describe(user="Opponent @user", stake_tokens="Optional token stake; both players pay this amount")
+async def duel_challenge_slash(interaction: discord.Interaction, user: discord.User, stake_tokens: int = 0):
+    await _note_name_interaction(interaction)
+    if not interaction.guild or user.bot or user.id == interaction.user.id:
+        await interaction.response.send_message("Pick a real human opponent in this server.", ephemeral=True); return
+    if stake_tokens < 0:
+        await interaction.response.send_message("Stake must be >= 0.", ephemeral=True); return
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        _note_display_name(conn, gid, interaction.user)
+        _note_display_name(conn, gid, user)
+        you = _accrue_tokens(conn, gid, interaction.user.id)
+        if stake_tokens > you["tokens"]:
+            await interaction.response.send_message(f"You only have {you['tokens']} token(s) here.", ephemeral=True); return
+        cur = conn.cursor()
+        cur.execute("UPDATE pvp_duel_challenges SET status='expired' WHERE guild_id=? AND status='open' AND created_ts<?",
+                    (gid, _now_ts() - 3600))
+        cur.execute("INSERT INTO pvp_duel_challenges(guild_id,challenger_id,target_id,stake_tokens,status,created_ts) "
+                    "VALUES (?,?,?,?, 'open', ?)",
+                    (gid, str(interaction.user.id), str(user.id), max(0, stake_tokens), _now_ts()))
+        conn.commit()
+    await interaction.response.send_message(
+        f"📣 {user.mention}, **{interaction.user.display_name}** challenged you to a duel!"
+        + (f" Stake: **{stake_tokens}** token(s) each." if stake_tokens else " No stake."),
+        ephemeral=False
+    )
+
+@bot.tree.command(name="duel_accept", description="Accept the most recent duel challenge sent to you in THIS server.")
+@app_commands.guild_only()
+async def duel_accept_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        ch = _open_challenge_for_target(conn, gid, interaction.user.id)
+        if not ch:
+            await interaction.response.send_message("No open challenge for you in this server.", ephemeral=True); return
+        stake = int(ch["stake_tokens"])
+        if stake:
+            ok_b, _, reason_b = _spend_tokens(conn, gid, interaction.user.id, stake)
+            if not ok_b:
+                await interaction.response.send_message(f"You cannot cover the stake: {reason_b}", ephemeral=True); return
+            ok_a, _, reason_a = _spend_tokens(conn, gid, int(ch["challenger_id"]), stake)
+            if not ok_a:
+                _add_tokens(conn, gid, interaction.user.id, stake)
+                await interaction.response.send_message("Challenger no longer has the stake; challenge cancelled.", ephemeral=True)
+                cur = conn.cursor()
+                cur.execute("UPDATE pvp_duel_challenges SET status='cancelled' WHERE id=?", (ch["id"],))
+                conn.commit()
+                return
+
+        rounds = []
+        a_pts = b_pts = 0
+        for _ in range(PVP_ROUNDS):
+            a_cards = _sample_user_cards_for_duel(conn, gid, int(ch["challenger_id"]), 3)
+            b_cards = _sample_user_cards_for_duel(conn, gid, int(ch["target_id"]), 3)
+            ascore = _pvp_score_cards(conn, a_cards)
+            bscore = _pvp_score_cards(conn, b_cards)
+            if ascore > bscore: a_pts += 1
+            elif bscore > ascore: b_pts += 1
+            rounds.append({"a": a_cards, "b": b_cards, "ascore": ascore, "bscore": bscore})
+
+        await interaction.response.defer(ephemeral=False)
+        a_user = interaction.guild.get_member(int(ch["challenger_id"]))
+        b_user = interaction.guild.get_member(int(ch["target_id"]))
+        await interaction.followup.send(
+            f"⚔️ **{a_user.display_name if a_user else 'Challenger'}** vs "
+            f"**{b_user.display_name if b_user else 'Target'}** — **Best of {PVP_ROUNDS}**!"
+        )
+
+        a_tally = b_tally = 0
+        with sqlite3.connect(DB_PATH) as conn2:
+            for i, rnd in enumerate(rounds, start=1):
+                ascore, bscore = rnd["ascore"], rnd["bscore"]
+                if ascore > bscore: a_tally += 1; outcome = "Challenger wins the round!"
+                elif bscore > ascore: b_tally += 1; outcome = "Target wins the round!"
+                else: outcome = "It's a draw!"
+                def label_list(ids):
+                    return "\n".join(f"- {_label_of_card_id(conn2, cid)}" for cid in ids)
+                emb = discord.Embed(
+                    title=f"Round {i}",
+                    description=(f"**Challenger score:** {ascore}  •  **Target score:** {bscore}\n"
+                                 f"**Result:** {outcome}\n"
+                                 f"**Tally:** {a_tally} — {b_tally}")
+                )
+                emb.add_field(name="Challenger cards", value=label_list(rnd["a"]) or "—", inline=True)
+                emb.add_field(name="Target cards", value=label_list(rnd["b"]) or "—", inline=True)
+                await interaction.followup.send(embed=emb)
+
+        if a_pts > b_pts:
+            winner = "a"; rt_a = stake * 2 if stake else 0; rt_b = 0; re_a = PVP_ESSENCE_WIN; re_b = PVP_ESSENCE_LOSS
+        elif b_pts > a_pts:
+            winner = "b"; rt_b = stake * 2 if stake else 0; rt_a = 0; re_b = PVP_ESSENCE_WIN; re_a = PVP_ESSENCE_LOSS
+        else:
+            winner = "draw"; rt_a = stake if stake else 0; rt_b = stake if stake else 0; re_a = re_b = 150
+
+        with sqlite3.connect(DB_PATH) as conn3:
+            if rt_a: _add_tokens(conn3, gid, int(ch["challenger_id"]), rt_a)
+            if rt_b: _add_tokens(conn3, gid, int(ch["target_id"]), rt_b)
+            if re_a: _add_essence(conn3, gid, int(ch["challenger_id"]), re_a)
+            if re_b: _add_essence(conn3, gid, int(ch["target_id"]), re_b)
+            cur3 = conn3.cursor()
+            cur3.execute("UPDATE pvp_duel_challenges SET status='accepted' WHERE id=?", (ch["id"],))
+            cur3.execute("""
+                INSERT INTO pvp_duel_matches(guild_id,user_a,user_b,rounds_json,result,stake_tokens,
+                                             reward_tokens_a,reward_tokens_b,reward_essence_a,reward_essence_b,created_ts)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (gid, ch["challenger_id"], ch["target_id"], str(rounds), winner, stake,
+                  rt_a, rt_b, re_a, re_b, _now_ts()))
+            conn3.commit()
+
+        result_text = (
+            f"Final: **{a_pts} — {b_pts}** "
+            f"Winner: **{'Challenger' if winner=='a' else ('Target' if winner=='b' else 'DRAW')}**\n"
+            f"Stake: {stake} • Rewards → Challenger: 🪙{rt_a} 💠{re_a} | Target: 🪙{rt_b} 💠{re_b}"
+        )
+        await interaction.followup.send(embed=discord.Embed(title="Duel Result", description=result_text))
+
+@bot.tree.command(name="duel_decline", description="Decline the most recent duel challenge sent to you.")
+@app_commands.guild_only()
+async def duel_decline_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        ch = _open_challenge_for_target(conn, gid, interaction.user.id)
+        if not ch:
+            await interaction.response.send_message("No open challenge for you.", ephemeral=True); return
+        cur = conn.cursor()
+        cur.execute("UPDATE pvp_duel_challenges SET status='declined' WHERE id=?", (ch["id"],))
+        conn.commit()
+    await interaction.response.send_message("❌ Challenge declined.", ephemeral=False)
+
+# --------- Auction House ---------
+def _owned_cards_with_metadata(conn: sqlite3.Connection, guild_id: str, user_id: int) -> List[Dict]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT c.id, c.name, c.pack, c.english_no, c.variant_index, c.type, c.rarity, c.image_url
+        FROM user_collection_guild u
+        JOIN cards c ON c.id = u.card_id
+        WHERE u.guild_id = ? AND u.user_id = ?
+        ORDER BY 
+          CASE 
+            WHEN instr(c.english_no,'/') > 0 THEN CAST(substr(c.english_no, 1, instr(c.english_no,'/')-1) AS INTEGER)
+            ELSE 9999
+          END,
+          c.id
+    """, (guild_id, str(user_id))).fetchall()
+    return [dict(r) for r in rows]
+
+def _escrow_card_for_listing(conn: sqlite3.Connection, seller_guild_id: str, seller_user_id: int, card_id: int) -> bool:
+    return _remove_card(conn, seller_guild_id, seller_user_id, card_id)
+
+def _deliver_card_to_buyer(conn: sqlite3.Connection, buyer_guild_id: str, buyer_user_id: int, card_id: int):
+    _give_card(conn, buyer_guild_id, buyer_user_id, card_id)
+
+def _debit_currency(conn: sqlite3.Connection, guild_id: str, user_id: int, amount: int, currency: str) -> Tuple[bool, str]:
+    if currency == "tokens":
+        ok, _user, reason = _spend_tokens(conn, guild_id, user_id, amount)
+        return ok, reason if not ok else "ok"
+    elif currency == "essence":
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        row = cur.execute("SELECT essence FROM users_guild WHERE guild_id=? AND user_id=?",
+                          (guild_id, str(user_id))).fetchone()
+        bal = int(row["essence"]) if row else 0
+        if bal < amount:
+            return False, f"Need {amount} essence; you have {bal} in this server."
+        ok, _new = _add_essence_delta(conn, guild_id, user_id, -amount)
+        return (True, "ok") if ok else (False, "Essence debit failed.")
+    return False, "Unknown currency."
+
+@bot.tree.command(name="mycards", description="List the cards you own in THIS server (ID • Name • Rarity).")
+@app_commands.guild_only()
+async def mycards_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        owned = _user_owned_card_ids(conn, gid, interaction.user.id)
+        if not owned:
+            await interaction.response.send_message("You don't own any cards in this server.", ephemeral=True); return
+        lines = []
+        cur = conn.cursor()
+        for cid in owned[:500]:
+            r = cur.execute("SELECT name, rarity, english_no FROM cards WHERE id=?", (cid,)).fetchone()
+            if r:
+                # Keep the line compact: "#123 — Name"
+                lines.append(f"#{cid} — {r[0]}")
+            else:
+                lines.append(f"#{cid}")
+    text = "**Your cards (first 500):**\n" + "\n".join(lines)
+    await interaction.response.send_message(text, ephemeral=True)
+
+@bot.tree.command(name="auction_list", description="List one of your cards on the global market (buy-it-now).")
+@app_commands.guild_only()
+@app_commands.describe(
+    card_id="Numeric card ID (use /mycards to find it)",
+    price_amount="Price",
+    price_currency="'tokens' or 'essence'",
+    expires_hours="Default 72"
+)
+async def auction_list_slash(
+    interaction: discord.Interaction,
+    card_id: int,
+    price_amount: int,
+    price_currency: str,
+    expires_hours: int = 72
+):
+    await _note_name_interaction(interaction)
+    price_currency = (price_currency or "").lower().strip()
+    if price_currency not in ("tokens", "essence"):
+        await interaction.response.send_message("Currency must be 'tokens' or 'essence'.", ephemeral=True); return
+    if price_amount <= 0:
+        await interaction.response.send_message("Price must be > 0.", ephemeral=True); return
+
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        _note_display_name(conn, gid, interaction.user)
+
+        # Require numeric ID that the user owns in THIS server:
+        if not _has_card(conn, gid, interaction.user.id, card_id):
+            await interaction.response.send_message(
+                "You don't own that card **in this server**. Use `/mycards` to see your IDs.",
+                ephemeral=True
+            )
+            return
+
+        # Escrow the card and create the listing
+        if not _escrow_card_for_listing(conn, gid, interaction.user.id, card_id):
+            await interaction.response.send_message("Could not escrow card.", ephemeral=True); return
+
+        cur = conn.cursor()
+        now = _now_ts()
+        exp = now + max(1, expires_hours) * 3600
+        cur.execute("""
+            INSERT INTO auction_listings(card_id,seller_user_id,seller_guild_id,price_amount,price_currency,status,created_ts,expires_ts)
+            VALUES (?,?,?,?,?,'active',?,?)
+        """, (card_id, str(interaction.user.id), gid, price_amount, price_currency, now, exp))
+        conn.commit()
+        listing_id = cur.lastrowid
+        label = _label_of_card_id(conn, card_id)
+
+    await interaction.response.send_message(
+        f"📣 Listed **{label}** for **{price_amount} {price_currency}** (Listing **{listing_id}**).",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="auction_browse", description="Browse active global listings.")
+@app_commands.guild_only()
+@app_commands.describe(limit="How many to show (max 20)", page="Page number starting at 1")
+async def auction_browse_slash(interaction: discord.Interaction, limit: int = 10, page: int = 1):
+    await _note_name_interaction(interaction)
+    limit = max(1, min(20, limit))
+    offset = (max(1, page) - 1) * limit
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT a.id, a.card_id, a.price_amount, a.price_currency, a.created_ts, a.expires_ts,
+                   c.name, c.rarity, c.english_no
+            FROM auction_listings a
+            JOIN cards c ON c.id = a.card_id
+            WHERE a.status='active' AND a.expires_ts > ?
+            ORDER BY a.created_ts DESC
+            LIMIT ? OFFSET ?
+        """, (_now_ts(), limit, offset)).fetchall()
+    if not rows:
+        await interaction.response.send_message("No active listings on this page.", ephemeral=True); return
+    lines = [f"**Global Auction House** — page {page}"]
+    for r in rows:
+        lines.append(f"- ID **{r['id']}** | **#{r['card_id']} {r['name']}** — **{r['price_amount']} {r['price_currency']}**")
+    await interaction.response.send_message("\n".join(lines), ephemeral=False)
+
+@bot.tree.command(name="auction_buy", description="Buy a listing from the global market.")
+@app_commands.guild_only()
+@app_commands.describe(listing_id="Listing ID to purchase")
+async def auction_buy_slash(interaction: discord.Interaction, listing_id: int):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        r = cur.execute("SELECT * FROM auction_listings WHERE id=?", (listing_id,)).fetchone()
+        if not r or r["status"] != "active" or r["expires_ts"] <= _now_ts():
+            await interaction.response.send_message("Listing not available.", ephemeral=True); return
+        if str(interaction.user.id) == r["seller_user_id"]:
+            await interaction.response.send_message("You can't buy your own listing.", ephemeral=True); return
+
+        ok, reason = _debit_currency(conn, gid, interaction.user.id, r["price_amount"], r["price_currency"])
+        if not ok:
+            await interaction.response.send_message(f"❌ {reason}", ephemeral=True); return
+
+        _deliver_card_to_buyer(conn, gid, interaction.user.id, r["card_id"])
+        cur.execute("""
+            UPDATE auction_listings
+            SET status='sold', buyer_user_id=?, buyer_guild_id=?
+            WHERE id=? AND status='active'
+        """, (str(interaction.user.id), gid, listing_id))
+        conn.commit()
+
+    await interaction.response.send_message(
+        f"✅ Purchased listing **{listing_id}**. Card delivered to this server’s collection.", ephemeral=False)
+
+@bot.tree.command(name="auction_cancel", description="Cancel your active listing and return the card.")
+@app_commands.guild_only()
+@app_commands.describe(listing_id="Listing ID to cancel")
+async def auction_cancel_slash(interaction: discord.Interaction, listing_id: int):
+    await _note_name_interaction(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        r = cur.execute("SELECT * FROM auction_listings WHERE id=?", (listing_id,)).fetchone()
+        if not r or r["status"] != "active":
+            await interaction.response.send_message("Listing not active.", ephemeral=True); return
+        if r["seller_user_id"] != str(interaction.user.id):
+            await interaction.response.send_message("Only the seller can cancel this listing.", ephemeral=True); return
+        _deliver_card_to_buyer(conn, r["seller_guild_id"], int(r["seller_user_id"]), r["card_id"])
+        cur.execute("UPDATE auction_listings SET status='cancelled' WHERE id=?", (listing_id,))
+        conn.commit()
+    await interaction.response.send_message("🟨 Listing cancelled and card returned.", ephemeral=False)
+
+# --------- NPC Duel helpers ---------
+NPC_RARITY_WEIGHTS = {
+    "rookie":  {"Common": 60, "Uncommon": 35, "Rare": 5},
+    "veteran": {"Common": 40, "Uncommon": 35, "Rare": 20, "Double Rare": 5},
+    "master":  {"Common": 25, "Uncommon": 30, "Rare": 25, "Double Rare": 10, "Ultra Rare": 7, "Illistration Rare": 3},
+}
+
+def _weighted_choice(items: List[int], weights: List[int], k: int) -> List[int]:
+    total = sum(weights)
+    out = []
+    for _ in range(k):
+        r = random.uniform(0, total)
+        upto = 0
+        for it, w in zip(items, weights):
+            upto += w
+            if upto >= r:
+                out.append(it); break
+    return out
+
+def _npc_cards_for_duel(conn: sqlite3.Connection, difficulty: str, k: int) -> List[int]:
+    cards = fetch_pack_cards(PACK_NAME_DEFAULT)
+    by_rar: Dict[str, List[int]] = {}
+    for c in cards:
+        by_rar.setdefault(c["rarity"], []).append(c["id"])
+    weights = NPC_RARITY_WEIGHTS.get(difficulty, NPC_RARITY_WEIGHTS["veteran"])
+    pop, wts = [], []
+    for rar, w in weights.items():
+        ids = by_rar.get(rar, [])
+        if not ids: continue
+        per = max(1, w // max(1, len(ids)))
+        for cid in ids:
+            pop.append(cid); wts.append(per)
+    if not pop:
+        pop = [c["id"] for c in cards]; wts = [1] * len(pop)
+    return _weighted_choice(pop, wts, k)
+
+def _score_cards(conn: sqlite3.Connection, card_ids: List[int], bias: float = 1.0) -> int:
+    total = 0.0
+    for cid in card_ids:
+        rar = _rarity_of_card_id(conn, cid)
+        base = RARITY_POWER.get(rar, 1)
+        total += base
+    total *= bias
+    total += random.uniform(0, len(card_ids) * 0.75)
+    return int(round(total))
+
+def _top_user_cards_for_duel(conn: sqlite3.Connection, guild_id: str, user_id: int, k: int) -> List[int]:
+    cur = conn.cursor()
+    owned_ids = [r[0] for r in cur.execute(
+        "SELECT card_id FROM user_collection_guild WHERE guild_id=? AND user_id=?",
+        (guild_id, str(user_id))
+    )]
+    scored = []
+    for cid in owned_ids:
+        rar = _rarity_of_card_id(conn, cid)
+        scored.append((RARITY_POWER.get(rar, 1), cid))
+    scored.sort(reverse=True)
+    top = [cid for _score, cid in scored[:k]]
+    if len(top) < k:
+        try:
+            pack_ids = [c["id"] for c in fetch_pack_cards(PACK_NAME_DEFAULT)]
+            random.shuffle(pack_ids)
+            top += pack_ids[:(k - len(top))]
+        except Exception:
+            pass
+    return top[:k]
+
+def _duel_on_cooldown(conn: sqlite3.Connection, guild_id: str, user_id: int) -> int:
+    cur = conn.cursor()
+    r = cur.execute("SELECT next_ts FROM npc_duel_cd WHERE guild_id=? AND user_id=?",
+                    (guild_id, str(user_id))).fetchone()
+    now = _now_ts()
+    return max(0, (r[0] - now)) if r else 0
+
+def _set_duel_cd(conn: sqlite3.Connection, guild_id: str, user_id: int):
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO npc_duel_cd(guild_id, user_id, next_ts) VALUES (?,?,?) "
+        "ON CONFLICT(guild_id, user_id) DO UPDATE SET next_ts=excluded.next_ts",
+        (guild_id, str(user_id), _now_ts() + DUEL_COOLDOWN_SECS)
+    )
+    conn.commit()
+
+@bot.tree.command(name="npcduel_start", description="Fight an NPC in a 3-round rarity-powered duel (with narration).")
+@app_commands.guild_only()
+@app_commands.describe(npc="rookie, veteran, or master", difficulty="easy, normal, hard")
+async def npcduel_start_slash(interaction: discord.Interaction, npc: str, difficulty: str):
+    await _note_name_interaction(interaction)
+    npc = (npc or "").lower().strip()
+    difficulty = (difficulty or "").lower().strip()
+    if npc not in NPCS:
+        await interaction.response.send_message("NPC must be one of: rookie, veteran, master.", ephemeral=True); return
+    if difficulty not in DUEL_REWARDS:
+        await interaction.response.send_message("Difficulty must be one of: easy, normal, hard.", ephemeral=True); return
+
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        cd = _duel_on_cooldown(conn, gid, interaction.user.id)
+        if cd > 0:
+            mm = cd // 60; ss = cd % 60
+            await interaction.response.send_message(f"⏳ You can duel again in **{mm}m {ss}s**.", ephemeral=True); return
+
+        conn.row_factory = sqlite3.Row
+        rounds = []
+        user_points = 0
+        npc_points = 0
+        npc_bias_map = {"easy": 0.90, "normal": 0.98, "hard": 1.00}
+        bias = npc_bias_map.get(difficulty, 0.98)
+        npc_key = npc
+
+        await interaction.response.defer(ephemeral=False)
+        await interaction.followup.send(
+            f"⚔️ **{interaction.user.display_name}** vs **{NPCS[npc]['name']}** "
+            f"({difficulty.title()}) — **Best of {DUEL_ROUNDS}** starts now!"
+        )
+
+        for r_i in range(1, DUEL_ROUNDS + 1):
+            u_cards = _top_user_cards_for_duel(conn, gid, interaction.user.id, 3)
+            n_cards = _npc_cards_for_duel(conn, npc_key, 3)
+            us, ns = _score_cards(conn, u_cards, 1.0), _score_cards(conn, n_cards, 1.0)
+            ns = int(round(ns * bias))
+            if us > ns: user_points += 1; round_outcome = "You win the round!"
+            elif ns > us: npc_points += 1; round_outcome = f"{NPCS[npc]['name']} wins the round!"
+            else: round_outcome = "It's a draw!"
+            rounds.append({"u": u_cards, "n": n_cards, "uscore": us, "nscore": ns})
+
+            def label_list(ids): return "\n".join(f"- {_label_of_card_id(conn, cid)}" for cid in ids)
+            emb = discord.Embed(
+                title=f"Round {r_i}",
+                description=(f"**Your score:** {us}  •  **{NPCS[npc]['name']}'s score:** {ns}\n"
+                             f"**Result:** {round_outcome}\n"
+                             f"**Tally:** You {user_points} — {npc_points} {NPCS[npc]['name']}")
+            )
+            emb.add_field(name="Your cards", value=label_list(u_cards) or "—", inline=True)
+            emb.add_field(name=f"{NPCS[npc]['name']}'s cards", value=label_list(n_cards) or "—", inline=True)
+            await interaction.followup.send(embed=emb)
+
+        if user_points > npc_points: result = "win"; rt, re = DUEL_REWARDS[difficulty]
+        elif npc_points > user_points: result = "loss"; rt, re = DUEL_CONSOLATION
+        else: result = "draw"; rt, re = (1, 200)
+
+        if rt: _add_tokens(conn, gid, interaction.user.id, rt)
+        if re: _add_essence(conn, gid, interaction.user.id, re)
+
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO npc_duel_matches(guild_id,user_id,npc_id,difficulty,rounds_json,result,reward_tokens,reward_essence,created_ts)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (gid, str(interaction.user.id), npc, difficulty, str(rounds), result, rt, re, _now_ts()))
+        conn.commit()
+        _set_duel_cd(conn, gid, interaction.user.id)
+
+    final = discord.Embed(
+        title="Duel Complete",
+        description=f"Final Score: **You {user_points} — {npc_points} {NPCS[npc]['name']}**\n"
+                    f"Outcome: **{result.upper()}**\n"
+                    f"Rewards: 🪙 +{rt}, 💠 +{re}"
+    )
+    await interaction.followup.send(embed=final)
+
+# ------------- TRADING -------------
+@bot.tree.command(name="trade_offer", description="Offer a card trade to another user (both cards must be owned here).")
+@app_commands.guild_only()
+@app_commands.describe(user="Target user", my_card_id="Your card ID", their_card_id="Their card ID")
+async def trade_offer_slash(interaction: discord.Interaction, user: discord.User, my_card_id: int, their_card_id: int):
+    await _note_name_interaction(interaction)
+    if not interaction.guild or user.bot or user.id == interaction.user.id:
+        await interaction.response.send_message("Pick a real human opponent in this server.", ephemeral=True); return
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        _note_display_name(conn, gid, interaction.user)
+        _note_display_name(conn, gid, user)
+        if not _has_card(conn, gid, interaction.user.id, my_card_id):
+            await interaction.response.send_message("You do not own that card here.", ephemeral=True); return
+        if not _has_card(conn, gid, user.id, their_card_id):
+            await interaction.response.send_message("They do not own that card here.", ephemeral=True); return
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trades_guild(guild_id,proposer_id,target_id,proposer_card_id,target_card_id,status,created_ts)
+            VALUES (?,?,?,?,?,'open',?)
+        """, (gid, str(interaction.user.id), str(user.id), my_card_id, their_card_id, _now_ts()))
+        conn.commit()
+        tid = cur.lastrowid
+        my_label = _label_of_card_id(conn, my_card_id)
+        their_label = _label_of_card_id(conn, their_card_id)
+    await interaction.response.send_message(
+        f"📦 Trade **#{tid}** offered to {user.mention}:\n"
+        f"**You give:** {my_label}\n**You get:** {their_label}\n"
+        f"{user.mention} use `/trade_accept {tid}` or `/trade_decline {tid}`.",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="trade_accept", description="Accept a pending trade offered to you.")
+@app_commands.guild_only()
+@app_commands.describe(trade_id="Trade ID")
+async def trade_accept_slash(interaction: discord.Interaction, trade_id: int):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        tr = cur.execute("SELECT * FROM trades_guild WHERE id=?", (trade_id,)).fetchone()
+        if not tr or tr["guild_id"] != gid or tr["status"] != "open":
+            await interaction.response.send_message("Trade not available.", ephemeral=True); return
+        if str(interaction.user.id) != tr["target_id"]:
+            await interaction.response.send_message("Only the target user can accept this trade.", ephemeral=True); return
+
+        proposer = int(tr["proposer_id"]); target = int(tr["target_id"])
+        a_card = int(tr["proposer_card_id"]); b_card = int(tr["target_card_id"])
+
+        if not _has_card(conn, gid, proposer, a_card):
+            await interaction.response.send_message("Proposer no longer owns their card.", ephemeral=True); return
+        if not _has_card(conn, gid, target, b_card):
+            await interaction.response.send_message("You no longer own your card.", ephemeral=True); return
+
+        if not _remove_card(conn, gid, proposer, a_card):
+            await interaction.response.send_message("Failed to move proposer card.", ephemeral=True); return
+        if not _remove_card(conn, gid, target, b_card):
+            _give_card(conn, gid, proposer, a_card)
+            await interaction.response.send_message("Failed to move your card.", ephemeral=True); return
+
+        _give_card(conn, gid, target, a_card)
+        _give_card(conn, gid, proposer, b_card)
+        cur.execute("UPDATE trades_guild SET status='accepted' WHERE id=?", (trade_id,))
+        conn.commit()
+
+        my_label = _label_of_card_id(conn, a_card)
+        their_label = _label_of_card_id(conn, b_card)
+    proposer_name = await _resolve_display_name(interaction, proposer)
+    target_name = await _resolve_display_name(interaction, target)
+    await interaction.response.send_message(
+        f"✅ Trade **#{trade_id}** completed.\n"
+        f"{proposer_name} ⇄ {target_name}\n"
+        f"**Moved:** {my_label} ⇄ {their_label}",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="trade_decline", description="Decline a pending trade offered to you.")
+@app_commands.guild_only()
+@app_commands.describe(trade_id="Trade ID")
+async def trade_decline_slash(interaction: discord.Interaction, trade_id: int):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        tr = cur.execute("SELECT * FROM trades_guild WHERE id=?", (trade_id,)).fetchone()
+        if not tr or tr["guild_id"] != gid or tr["status"] != "open":
+            await interaction.response.send_message("Trade not available.", ephemeral=True); return
+        if str(interaction.user.id) not in (tr["target_id"], tr["proposer_id"]):
+            await interaction.response.send_message("Only participants can decline this trade.", ephemeral=True); return
+        cur.execute("UPDATE trades_guild SET status='declined' WHERE id=?", (trade_id,))
+        conn.commit()
+    await interaction.response.send_message("❌ Trade declined.", ephemeral=False)
+
+# ------------- ESSENCE SHOP -------------
+def _shop_today_key() -> int:
+    return _yyyymmdd_local(_now_ts())
+
+def _pick_random_card_ids_by_rarity(conn: sqlite3.Connection, rarities: List[str], k: int) -> List[int]:
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    qs = ",".join("?" for _ in rarities)
+    rows = cur.execute(f"SELECT id FROM cards WHERE rarity IN ({qs}) AND pack=?", (*rarities, PACK_NAME_DEFAULT)).fetchall()
+    ids = [r["id"] for r in rows]
+    random.shuffle(ids)
+    return ids[:k]
+
+def _shop_generate_items(conn: sqlite3.Connection, guild_id: str) -> List[Dict]:
+    items = []
+    token_slot = random.randint(1, SHOP_COMMON_SLOTS)
+    for slot in range(1, SHOP_COMMON_SLOTS + 1):
+        if slot == token_slot:
+            items.append({
+                "slot": slot, "type": "tokens", "price": SHOP_PRICE_TOKEN_BUNDLE,
+                "data": {"amount": SHOP_TOKEN_BUNDLE}, "stock": 1
+            })
+        else:
+            ids = _pick_random_card_ids_by_rarity(conn, ["Common", "Uncommon"], 10)
+            cid = ids[0] if ids else None
+            items.append({
+                "slot": slot, "type": "card_common", "price": SHOP_PRICE_COMMON_CARD,
+                "data": {"card_id": cid}, "stock": 1
+            })
+    rare_ids = _pick_random_card_ids_by_rarity(conn,
+        ["Double Rare", "Ultra Rare", "Illistration Rare", "Special Illistration Rare", "Black White Rare"], 10)
+    rare_cid = rare_ids[0] if rare_ids else None
+    items.append({
+        "slot": SHOP_RARE_SLOT, "type": "card_rare", "price": SHOP_PRICE_RARE_CARD,
+        "data": {"card_id": rare_cid}, "stock": 1
+    })
+    items.append({
+        "slot": SHOP_SPECIAL_SLOT, "type": "special_pack", "price": 0,
+        "data": {"note": "coming_soon"}, "stock": 0
+    })
+    return items
+
+def _shop_get_or_create_today(conn: sqlite3.Connection, guild_id: str) -> List[Dict]:
+    today = _shop_today_key()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    row = cur.execute("SELECT yyyymmdd, items_json FROM shop_state_guild WHERE guild_id=?", (guild_id,)).fetchone()
+    if row and int(row["yyyymmdd"]) == today:
+        return json.loads(row["items_json"])
+    items = _shop_generate_items(conn, guild_id)
+    cur.execute("""
+        INSERT INTO shop_state_guild(guild_id, yyyymmdd, items_json)
+        VALUES (?,?,?)
+        ON CONFLICT(guild_id) DO UPDATE SET yyyymmdd=excluded.yyyymmdd, items_json=excluded.items_json
+    """, (guild_id, today, json.dumps(items)))
+    conn.commit()
+    return items
+
+def _shop_save(conn: sqlite3.Connection, guild_id: str, items: List[Dict]):
+    today = _shop_today_key()
+    conn.execute("""
+        INSERT INTO shop_state_guild(guild_id, yyyymmdd, items_json)
+        VALUES (?,?,?)
+        ON CONFLICT(guild_id) DO UPDATE SET yyyymmdd=excluded.yyyymmdd, items_json=excluded.items_json
+    """, (guild_id, today, json.dumps(items)))
+    conn.commit()
+
+def _shop_card_label(conn: sqlite3.Connection, cid: Optional[int]) -> str:
+    if not cid:
+        return "(unknown card)"
+    return _label_of_card_id(conn, cid)
+
+@bot.tree.command(name="shop_show", description="Show today's Essence Shop (resets daily).")
+@app_commands.guild_only()
+async def shop_show_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
+    await interaction.response.defer(ephemeral=False)  # prevent 'application didn't respond'
+    try:
+        gid = _guild_id(interaction)
+        with sqlite3.connect(DB_PATH) as conn:
+            items = _shop_get_or_create_today(conn, gid)
+            lines = [f"🛒 **Essence Shop — {time.strftime('%Y-%m-%d', time.localtime())}**"]
+            for it in items:
+                slot = it["slot"]; typ = it["type"]; price = it["price"]; stock = it["stock"]
+                if typ == "tokens":
+                    lines.append(f"{slot}) **Token Bundle**: +{it['data']['amount']} tokens — **{price} essence**  (stock {stock})")
+                elif typ == "card_common":
+                    lines.append(f"{slot}) **Common Card**: {_shop_card_label(conn, it['data']['card_id'])} — **{price} essence**  (stock {stock})")
+                elif typ == "card_rare":
+                    lines.append(f"{slot}) **Rare Card**: {_shop_card_label(conn, it['data']['card_id'])} — **{price} essence**  (stock {stock})")
+                elif typ == "special_pack":
+                    lines.append(f"{slot}) **Special Shop Pack** — *coming soon*  (not purchasable)")
+                else:
+                    lines.append(f"{slot}) (unknown item)")
+            lines.append("\nBuy with `/shop_buy slot_number`.")
+        await interaction.followup.send("\n".join(lines), ephemeral=False)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Shop failed: `{type(e).__name__}: {e}`", ephemeral=True)
+
+@bot.tree.command(name="shop_buy", description="Buy an item from today's Essence Shop.")
+@app_commands.guild_only()
+@app_commands.describe(slot="Slot number (1-6)")
+async def shop_buy_slash(interaction: discord.Interaction, slot: int):
+    await _note_name_interaction(interaction)
+    gid = _guild_id(interaction)
+    if slot < 1 or slot > 6:
+        await interaction.response.send_message("Slot must be 1-6.", ephemeral=True); return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        items = _shop_get_or_create_today(conn, gid)
+        item = next((it for it in items if it["slot"] == slot), None)
+        if not item:
+            await interaction.response.send_message("That slot is not available.", ephemeral=True); return
+        if item["stock"] <= 0:
+            await interaction.response.send_message("That item is sold out.", ephemeral=True); return
+        if item["type"] == "special_pack":
+            await interaction.response.send_message("Special pack is coming soon — not purchasable yet.", ephemeral=True); return
+
+        price = int(item["price"])
+        ok, _new = _add_essence_delta(conn, gid, interaction.user.id, -price)
+        if not ok:
+            bal = conn.execute("SELECT essence FROM users_guild WHERE guild_id=? AND user_id=?",
+                               (gid, str(interaction.user.id))).fetchone()
+            bal = int(bal["essence"]) if bal else 0
+            await interaction.response.send_message(f"Not enough essence. Need {price}, you have {bal}.", ephemeral=True); return
+
+        if item["type"] == "tokens":
+            _add_tokens(conn, gid, interaction.user.id, int(item["data"]["amount"]))
+            delivered = f"+{item['data']['amount']} tokens"
+        elif item["type"] in ("card_common", "card_rare"):
+            cid = int(item["data"]["card_id"]) if item["data"]["card_id"] else None
+            if not cid:
+                await interaction.response.send_message("This card is unavailable.", ephemeral=True); return
+            _give_card(conn, gid, interaction.user.id, cid)
+            delivered = f"{_shop_card_label(conn, cid)}"
+        else:
+            delivered = "(unknown)"
+
+        for it in items:
+            if it["slot"] == slot:
+                it["stock"] = max(0, it["stock"] - 1)
+                break
+        _shop_save(conn, gid, items)
+
+    await interaction.response.send_message(f"✅ Purchased slot {slot}: **{delivered}**", ephemeral=False)
+
+@bot.tree.command(name="shop_reset", description="(Admin) Force-refresh today's Essence Shop for this server.")
+@app_commands.guild_only()
+async def shop_reset_slash(interaction: discord.Interaction):
+    await _note_name_interaction(interaction)
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need Manage Server permission.", ephemeral=True); return
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        items = _shop_generate_items(conn, gid)
+        _shop_save(conn, gid, items)
+    await interaction.response.send_message("🧹 Shop refreshed for today.", ephemeral=True)
 
 # ------------- Entry -------------
 if __name__ == "__main__":
@@ -900,4 +1965,3 @@ if __name__ == "__main__":
     if not token:
         raise RuntimeError("Set DISCORD_TOKEN environment variable (your bot token).")
     bot.run(token)
-
