@@ -725,7 +725,7 @@ bot = CardBot()
 @bot.event
 async def on_ready():
     ensure_db()
-    # Fast per-guild sync so slash commands appear instantly in every server
+    # Fast per-guild sync so slash commands appear instantly in all conected servers
     try:
         synced_guilds = 0
         for g in bot.guilds:
@@ -735,7 +735,7 @@ async def on_ready():
                 synced_guilds += 1
             except Exception as e:
                 print(f"[sync error] guild {g.id}: {e}")
-        # Global sync as a harmless fallback
+        # Global sync as a fallback
         try:
             await bot.tree.sync()
             print("[sync] Global slash commands synced")
@@ -748,7 +748,7 @@ async def on_ready():
     await bot.change_presence(activity=discord.Game(name=BOT_ACTIVITY))
     print(f"Logged in as {bot.user} (id {bot.user.id})")
 
-# NEW: Sync immediately when the bot joins a new guild
+# Sync immediately when the bot joins a new guild
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     try:
@@ -1244,9 +1244,18 @@ def _sample_user_cards_for_duel(conn: sqlite3.Connection, guild_id: str, user_id
     owned = _user_owned_card_ids(conn, guild_id, user_id)
     if len(owned) >= k:
         return random.sample(owned, k)
+
+    # Fall back to sampling from the full pack if the user owns fewer than k cards
     try:
         pool = [c["id"] for c in fetch_pack_cards(PACK_NAME_DEFAULT)]
-        extra = random.sample(pool, min(k - len(owned), len(pool))) if pool else []
+    except Exception:
+        pool = []
+
+    extra_needed = max(0, k - len(owned))
+    extra = random.sample(pool, min(extra_needed, len(pool))) if pool else []
+
+    # If pool is empty, just return whatever the user owns
+    return (owned + extra)[:k]
 
 # -------- /setcard pack number (set card for profile) --------
 @bot.tree.command(name="setcard", description="Set your profile card")
@@ -1502,8 +1511,7 @@ def _owned_cards_with_metadata(conn: sqlite3.Connection, guild_id: str, user_id:
         FROM user_collection_guild u
         JOIN cards c ON c.id = u.card_id
         WHERE u.guild_id = ? AND u.user_id = ?
-        ORDER BY 
-          CASE 
+        ORDER BY CASE 
             WHEN instr(c.english_no,'/') > 0 THEN CAST(substr(c.english_no, 1, instr(c.english_no,'/')-1) AS INTEGER)
             ELSE 9999
           END,
@@ -1547,7 +1555,7 @@ async def mycards_slash(interaction: discord.Interaction):
         for cid in owned[:500]:
             r = cur.execute("SELECT name, rarity, english_no FROM cards WHERE id=?", (cid,)).fetchone()
             if r:
-                # Keep the line compact: "#123 — Name"
+                # Keeps the lien compact
                 lines.append(f"#{cid} — {r[0]}")
             else:
                 lines.append(f"#{cid}")
@@ -1580,7 +1588,7 @@ async def auction_list_slash(
     with sqlite3.connect(DB_PATH) as conn:
         _note_display_name(conn, gid, interaction.user)
 
-        # Require numeric ID that the user owns in THIS server:
+        # Require numeric ID that the user owns in the server:
         if not _has_card(conn, gid, interaction.user.id, card_id):
             await interaction.response.send_message(
                 "You don't own that card **in this server**. Use `/mycards` to see your IDs.",
@@ -2290,7 +2298,7 @@ async def mycards_slash(interaction: discord.Interaction):
         for cid in owned[:500]:
             r = cur.execute("SELECT name, rarity, english_no FROM cards WHERE id=?", (cid,)).fetchone()
             if r:
-                # Keep the line compact: "#123 — Name"
+                # Keep the line compact
                 lines.append(f"#{cid} — {r[0]}")
             else:
                 lines.append(f"#{cid}")
@@ -2323,7 +2331,7 @@ async def auction_list_slash(
     with sqlite3.connect(DB_PATH) as conn:
         _note_display_name(conn, gid, interaction.user)
 
-        # Require numeric ID that the user owns in THIS server:
+        # Require numeric ID that the user owns in the server:
         if not _has_card(conn, gid, interaction.user.id, card_id):
             await interaction.response.send_message(
                 "You don't own that card **in this server**. Use `/mycards` to see your IDs.",
