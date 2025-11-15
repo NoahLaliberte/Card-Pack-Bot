@@ -131,6 +131,7 @@ def ensure_db():
             tokens_used    INTEGER NOT NULL DEFAULT 0,
             first_seen_ts  INTEGER NOT NULL DEFAULT 0,
             last_update_ts INTEGER NOT NULL DEFAULT 0,
+            profile_card   TEXT NOT NULL DEFAULT 'blank',
             PRIMARY KEY(guild_id, user_id)
         )
         """)
@@ -864,8 +865,14 @@ async def profile_slash(interaction: discord.Interaction, user: discord.User):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         rarities = {row["id"]: row["rarity"] for row in cur.execute("SELECT id, rarity FROM cards")}
-        tokens = cur.execute("SELECT tokens_used FROM users_guild WHERE guild_id=? AND user_id=?", (gid,uid))
-        token_count = tokens = cur.fetchone()[0]
+        token_count = cur.execute("SELECT tokens_used FROM users_guild WHERE guild_id=? AND user_id=?", (gid,uid))
+        token_count = cur.fetchone()[0]
+        profile_card = None
+        try:
+            profile_card = cur.execute("SELECT profile_card FROM users_guild WHERE guild_id=? AND user_id=?", (gid,uid))
+            profile_card = cur.fetchone()[0]
+        except Exception:
+            pass
         owned_ids = [r[0] for r in cur.execute(
             "SELECT card_id FROM user_collection_guild WHERE guild_id=? AND user_id=?",
             (gid, uid)
@@ -879,8 +886,53 @@ async def profile_slash(interaction: discord.Interaction, user: discord.User):
     message.append(f'{user.mention}\'s Profile')
     message.append(f'Tokens Used: {token_count}')
     message.append(f'Collection Score: {pts}')
+    if (profile_card != None):
+        message.append(f'Favorite Card:')
+        async with aiohttp.ClientSession() as session:
+            e = discord.embed()
+            files: List[discord.File] = []
+            img_url = cur.execute("SELECT image_url FROM cards WHERE english_no=?", (profile_card))
+            img_url = cur.fetchone()
+            f, reason = await fetch_image_as_file(session, img_url, f"profile card")
+            if f:
+                files.append(f)
+                e.set_image(url=f"attachment://{f.filename}")
+                if reason != "ok":
+                    e.set_footer(text=f"({reason})")
+            else:
+                if img_url:
+                    e.set_image(url=img_url)
+                    e.set_footer(text=f"(attachment skipped: {reason})")
+                else:
+                    e.set_footer(text="(No image_url in DB for this card)")
+            message.append(e)
+
     await interaction.response.send_message("\n".join(message), ephemeral=False)
 
+
+# -------- /setcard pack number (set card for profile) --------
+@bot.tree.command(name="setcard", description="Set your profile card")
+@app_commands.describe(pack="Choose a pack name")
+@app_commands.describe(card="Card number (check collection)")
+async def setcard_slash(interaction: discord.Interaction, pack: str, card: str):
+    ensure_db()
+    gid = _guild_id(interaction)
+    uid = interaction.user.id
+    message = "Updated Profile Card"
+    card_id = int(card)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        r = cur.execute(
+        "SELECT 1 FROM user_collection_guild WHERE guild_id=? AND user_id=? AND card_id=?",
+        (str(gid), str(uid), card_id)
+        ).fetchone()
+        if r is not None:
+            cur.execute("INSERT OR IGNORE INTO users_guild(guild_id, user_id, profile_card) VALUES (?, ?)", (str(gid), str(uid), r))
+        else:
+            message = "Failed to update card, card was not owner"
+        
+    await interaction.response.send_message(message, ephemeral=True)
 
 # --------- Autocomplete for the 'pack' argument ---------
 
@@ -893,9 +945,19 @@ async def pack_autocomplete(interaction: discord.Interaction, current: str):
         packs = []
     return choices_from(current, packs, limit=25)
 
+@setcard_slash.autocomplete("pack")
+async def pack_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        ensure_db()
+        packs = list_packs()
+    except Exception:
+        packs = []
+    return choices_from(current, packs, limit=25)
+
 # ------------- Entry -------------
 if __name__ == "__main__":
     ensure_db()
+    # set DISCORD_TOKEN env var before next line
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("Set DISCORD_TOKEN environment variable (your bot token).")
