@@ -3635,6 +3635,122 @@ async def setcard_slash(
 
     await interaction.response.send_message(message, ephemeral=True)
 
+# fax
+@bot.tree.command(name="fax", description="Show helpful information about how CardBot works.")
+async def fax(interaction: discord.Interaction):
+    """A user-friendly FAQ-style explanation of the core CardBot systems."""
+
+    text = (
+        "**📌 Tokens**\n"
+        "Tokens refill automatically each day. You spend them to open packs.\n\n"
+
+        "**📌 Essence**\n"
+        "You earn essence by opening packs or selling tokens. Essence is used in shops.\n\n"
+
+        "**📌 Collection Score**\n"
+        "Your score increases based on card rarity. Higher rarity = more points.\n\n"
+
+        "**📌 Favorite Card**\n"
+        "Use /setcard to set one of your owned cards as your profile favorite.\n\n"
+
+        "**📌 Shops**\n"
+        "/shop_show displays today’s Essence Shop. /shop_buy lets you buy items.\n\n"
+
+        "**📌 Trading**\n"
+        "Use /trade_offer to send another user a card trade.\n\n"
+
+        "**📌 Duels**\n"
+        "Some servers support duels where card rarity determines power.\n\n"
+
+        "**📌 Packs**\n"
+        "Use /packopen to open a pack of 9 cards. Use /packs to view available packs.\n\n"
+
+        "**📌 Weekly Events**\n"
+        "Use /weekly_event to view special bonuses active this week.\n\n"
+
+        "If you have more questions, try /help_cardbot for a full command list."
+    )
+
+    await interaction.response.send_message(text)
+
+# -------- /cardinfo pack card_id (show a specific card) --------
+@bot.tree.command(
+    name="cardinfo",
+    description="Show information and image for a specific card by pack + card ID."
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    pack="Pack name (use /packs to see list)",
+    card_id="Card ID number from /mycards or list"
+)
+async def cardinfo_slash(
+    interaction: discord.Interaction,
+    pack: str,
+    card_id: int,
+):
+    ensure_db()
+    await _note_name_interaction(interaction)
+
+    # Clean and validate the pack input
+    pack = (pack or "").strip()
+    if pack not in list_packs():
+        await interaction.response.send_message(
+            f"Unknown pack. Valid options: {', '.join(PACKS_ALL)}",
+            ephemeral=True,
+        )
+        return
+
+    # Look up the card in the cards table
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT * FROM cards WHERE pack=? AND id=?",
+            (pack, card_id),
+        ).fetchone()
+
+    if row is None:
+        await interaction.response.send_message(
+            "No card found with that pack and ID.",
+            ephemeral=True,
+        )
+        return
+
+    keys = row.keys()
+
+    # Safely read whatever fields exist in the table
+    name = row["name"] if "name" in keys else f"Card #{row['id']}"
+    rarity = row["rarity"] if "rarity" in keys else None
+    supertype = row["supertype"] if "supertype" in keys else None
+    subtype = row["subtype"] if "subtype" in keys else None
+    hp = row["hp"] if "hp" in keys else None
+    image_url = row["image_url"] if "image_url" in keys else None
+
+    # Build a description using only available fields
+    desc_lines = [
+        f"**Pack:** {row['pack']}",
+        f"**Card ID:** {row['id']}",
+    ]
+    if rarity:
+        desc_lines.append(f"**Rarity:** {rarity}")
+    if supertype:
+        desc_lines.append(f"**Type:** {supertype}")
+    if subtype:
+        desc_lines.append(f"**Subtype:** {subtype}")
+    if hp:
+        desc_lines.append(f"**HP:** {hp}")
+
+    description = "\n".join(desc_lines)
+
+    embed = discord.Embed(
+        title=name,
+        description=description,
+        color=0x00FF00,
+    )
+    if image_url:
+        embed.set_image(url=image_url)
+
+    await interaction.response.send_message(embed=embed)
 
 # --------- Autocomplete for pack arguments ---------
 @packopen_slash.autocomplete("pack")
@@ -3733,6 +3849,16 @@ async def trade_their_pack_autocomplete(
         return []
     return choices_from(current, packs)
 
+@cardinfo_slash.autocomplete("pack")
+async def cardinfo_pack_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    try:
+        packs = list_packs()
+    except Exception:
+        return []
+    return choices_from(current, packs)
 
 # ------------- Entry -------------
 if __name__ == "__main__":
