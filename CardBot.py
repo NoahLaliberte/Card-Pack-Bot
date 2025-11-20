@@ -48,7 +48,7 @@ STORMFRONT_PACK_PRICE = 3000  # essence cost per Stormfront pack in shop
 PACKS_ALL = sorted(TOKEN_PACKS | SHOP_ONLY_PACKS)
 
 # Dev knob for testing tokens
-DEV_FORCE_MAX_TOKENS = True
+DEV_FORCE_MAX_TOKENS = False
 
 # ---------- IMAGE LIMITS / SETTINGS ----------
 MAX_UPLOAD_BYTES = 7 * 1024 * 1024
@@ -1310,6 +1310,10 @@ def choices_from(
 @app_commands.guild_only()
 async def weekly_event_slash(interaction: discord.Interaction):
     await _note_name_interaction(interaction)
+
+    # Immediately defer so we don't hit the 3-second interaction timeout
+    await interaction.response.defer(ephemeral=False)
+
     gid = _guild_id(interaction)
     with sqlite3.connect(DB_PATH) as conn:
         ev = _get_or_create_weekly_event(conn, gid)
@@ -1318,7 +1322,13 @@ async def weekly_event_slash(interaction: discord.Interaction):
         f"📅 **This week's event:** {ev['name']}\n"
         f"{ev['description']}"
     )
-    await interaction.response.send_message(text, ephemeral=False)
+
+    # If the interaction somehow expired anyway, just ignore the error
+    try:
+        await interaction.followup.send(text, ephemeral=False)
+    except discord.NotFound:
+        # Interaction token is no longer valid; nothing we can do
+        return
 
 # /token
 @bot.tree.command(
@@ -1338,6 +1348,50 @@ async def token_slash(interaction: discord.Interaction):
             ephemeral=True,
         )
 
+@bot.tree.command(
+    name="tokens_add",
+    description="(Admin) Add tokens to a user's balance in THIS server.",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    user="User to add tokens to",
+    amount="How many tokens to add (must be > 0, capped at the token max).",
+)
+async def tokens_add_slash(
+    interaction: discord.Interaction,
+    user: discord.User,
+    amount: int,
+):
+    await _note_name_interaction(interaction)
+
+    # Permission check: require Manage Server
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "You need **Manage Server** permission to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    if amount <= 0:
+        await interaction.response.send_message(
+            "Amount must be a number greater than 0.",
+            ephemeral=True,
+        )
+        return
+
+    gid = _guild_id(interaction)
+    with sqlite3.connect(DB_PATH) as conn:
+        updated = _add_tokens(conn, gid, user.id, amount)
+
+    cap_note = ""
+    if updated["tokens"] >= TOKEN_CAP:
+        cap_note = f" (hit the cap of {TOKEN_CAP} tokens)"
+
+    await interaction.response.send_message(
+        f"✅ Added **{amount}** token(s) to {user.mention} in this server.\n"
+        f"They now have **{updated['tokens']}** token(s){cap_note}.",
+        ephemeral=False,
+    )
 
 # /essence
 @bot.tree.command(
@@ -1360,7 +1414,7 @@ async def essence_slash(interaction: discord.Interaction):
     name="gamble", description="Gamble some of your tokens in THIS server."
 )
 @app_commands.guild_only()
-@app_commands.describe(amount="How many tokens to gamble (up to your balance here).")
+@app_commands.describe(amount="How many tokens to gamble remember only bet what you have.")
 async def gamble_slash(interaction: discord.Interaction, amount: int):
     await _note_name_interaction(interaction)
     if amount <= 0:
@@ -1384,15 +1438,15 @@ async def gamble_slash(interaction: discord.Interaction, amount: int):
             _add_tokens(
                 conn, gid, interaction.user.id, min(amount * 2, TOKEN_CAP)
             )
-            msg = "✨ **Doubled your bet** and added to your tokens."
+            msg = "✨ **You encountered a pack of Pichu's and played with them, they were so hapy they doubled your tokens and ran back into the grass**."
         elif roll == 2:
             _add_tokens(conn, gid, interaction.user.id, amount)
-            msg = "😊 **Your bet is refunded**."
+            msg = "😊 **Mr.Mime grabbed your tokens and ran away but in truth he mimed it, so your tokens are safe**."
         else:
             give_back = amount // 2
             if give_back:
                 _add_tokens(conn, gid, interaction.user.id, give_back)
-            msg = "😴 **You lost half of your bet.**"
+            msg = "😴 **You encountered a snorlax who was to lazy to take all your tokens so only toke half before taking a nap.**"
 
         final = _accrue_tokens(conn, gid, interaction.user.id)
         cap_note = (
@@ -1412,7 +1466,7 @@ async def gamble_slash(interaction: discord.Interaction, amount: int):
     description="Sell tokens for essence in THIS server (200 essence per token).",
 )
 @app_commands.guild_only()
-@app_commands.describe(amount="How many tokens you want to sell.")
+@app_commands.describe(amount="How many tokens do you want to sell.")
 async def sell_slash(interaction: discord.Interaction, amount: int):
     await _note_name_interaction(interaction)
     if amount <= 0:
@@ -1538,7 +1592,7 @@ def _collection_embeds_for_pack(
 
 @bot.tree.command(
     name="collection",
-    description="View your card collection for a specific pack in THIS server.",
+    description="View your card collection for a specific pack in this server.",
 )
 @app_commands.guild_only()
 @app_commands.describe(pack="Which pack do you want to view?")
@@ -1629,26 +1683,95 @@ async def scoreboard_slash(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def help_slash(interaction: discord.Interaction):
     await _note_name_interaction(interaction)
-    text = (
-        "**Core**\n"
-        "**/packopen**, **/packs**, **/packsim**, **/collection**, **/scoreboard**, **/token**, **/sell**, **/essence**, **/gamble**\n"
-        "\n**Duels**\n"
-        "**/npcduel_start**, **/duel_challenge**, **/duel_accept**, **/duel_decline**\n"
-        "\n**Auction House**\n"
-        "**/mycards**, **/auction_list**, **/auction_browse**, **/auction_buy**, **/auction_cancel**\n"
-        "Note: Use **/mycards** to copy a numeric ID, then pass it to **/auction_list** `card_id`.\n"
-        "\n**Trading**\n"
-        "**/trade_offer @user pack + card IDs**, **/trade_accept trade_id**, **/trade_decline trade_id**\n"
-        "\n**Essence Shop**\n"
-        "**/shop_show**, **/shop_buy slot**, **/shop_reset** (admin)\n"
-    )
-    await interaction.response.send_message(text, ephemeral=True)
 
+    # Break the help text into logical sections
+    sections = [
+        # Core
+        (
+            "**Core Commands**\n"
+            "**/packopen** – Open a token pack in this server which costs 1 token.\n"
+            "**/packs** – List all available packs and how to get them.\n"
+            "**/packsim** – Simulate opening packs without spending tokens.\n"
+            "**/token** – Show your token balance and next refill time in this server.\n"
+            "**/sell** – Sell tokens for essence in this server.\n"
+            "**/essence** – Show your essence balance in this server.\n"
+            "**/gamble** – Gamble some of your tokens for a chance to double your tokens or lose them.\n"
+            "**/weekly_event** – Show this server's current weekly bonus event.\n"
+        ),
+        # Collection / profile
+        (
+            "\n**Collection & Profile**\n"
+            "**/collection** – View your card collection for a specific pack.\n"
+            "**/scoreboard** – View the server leaderboard by collection score.\n"
+            "**/profile** – Show a user’s profile.\n"
+            "**/setcard** – Set your profile’s favorite card which must be owned.\n"
+            "**/cardinfo** – Show details and image for a specific card by pack and ID.\n"
+        ),
+        # Duels
+        (
+            "\n**Duels**\n"
+            "**/npcduel_start** – Fight an NPC in a 3-round rarity-powered duel.\n"
+            "**/duel_challenge** – Challenge another player in this server to a PvP duel.\n"
+            "**/duel_accept** – Accept the most recent duel challenge sent to you.\n"
+            "**/duel_decline** – Decline the most recent duel challenge sent to you.\n"
+        ),
+        # Auction
+        (
+            "\n**Auction House**\n"
+            "**/mycards** – List the cards you own from a specific pack with ID's (used for all auction and trade commands to get the right card ID).\n"
+            "**/auction_list** – List one of your cards on the global market.\n"
+            "**/auction_browse** – Browse active global auction listings.\n"
+            "**/auction_buy** – Buy a card from a specific auction listing.\n"
+            "**/auction_cancel** – Cancel your active listing and get the card back.\n"
+        ),
+        # Trading
+        (
+            "\n**Trading**\n"
+            "**/trade_offer** – Offer a card trade to another user, the cards must be owned per person trading.\n"
+            "**/trade_accept** – Accept a pending trade offered to you.\n"
+            "**/trade_decline** – Decline a pending trade you are involved in.\n"
+        ),
+        # Shop
+        (
+            "\n**Essence Shop**\n"
+            "**/shop_show** – Show today’s Essence Shop for this server.\n"
+            "**/shop_buy** – Buy an item from a specific shop slot.\n"
+            "**/shop_reset** – Force-refresh today’s shop.\n"
+        ),
+        # Info or admin
+        (
+            "\n**Info & Admin**\n"
+            "**/fax** – FAQ-style explanation of how CardBot systems work.\n"
+            "**/help_cardbot** – Show this command list.\n"
+            "**/resync** – Force re-sync slash commands to all joined guilds (admin/owner).\n"
+            "**/tokens_add** – Add tokens to a user for demos or manual fixes.\n"
+        ),
+    ]
+
+    pages: list[str] = []
+    current = ""
+
+    for part in sections:
+        if len(current) + len(part) > 1900:
+            if current:
+                pages.append(current)
+            current = part
+        else:
+            current += part
+    if current:
+        pages.append(current)
+
+    # Send first page as the initial response
+    await interaction.response.send_message(pages[0], ephemeral=True)
+
+    # Remaining pages as followups
+    for page in pages[1:]:
+        await interaction.followup.send(page, ephemeral=True)
 
 # -------- PACK OPEN --------
 @bot.tree.command(
     name="packopen",
-    description="Open 1 pack (9 cards) in THIS server and display images.",
+    description="Open 1 pack in this server and display images.",
 )
 @app_commands.guild_only()
 @app_commands.describe(pack="Choose a pack name (token packs only)")
